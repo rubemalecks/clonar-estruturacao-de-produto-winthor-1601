@@ -1,0 +1,50 @@
+# Credenciais e configurações locais
+.env
+.env.*
+!.env.example
+!.env.*.example
+.aws/
+credentials.json
+secrets.json
+secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Oracle Client, conexões e wallets
+oracle_client/
+wallet/
+wallets/
+Wallet_*.zip
+*.sso
+*.p7b
+tnsnames.ora
+sqlnet.ora
+oraaccess.xml
+
+# Ambientes Python e caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Compilação, executáveis, logs e arquivos temporários
+build/
+dist/
+*.spec
+*.exe
+*.dll
+*.log
+*.tmp
+*.bak
+*.dmp
+*.dump
