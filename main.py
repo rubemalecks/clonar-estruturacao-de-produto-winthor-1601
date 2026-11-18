@@ -1,15 +1,17 @@
 """RB Formulações 1601 - copiar composição WinThor com prévia e transação."""
 import os
+import re
+import struct
 import sys
 from collections import Counter
 from pathlib import Path
 from dotenv import load_dotenv
-from decimal import Decimal, localcontext
+from decimal import Decimal
 from PySide6.QtCore import Qt, QTimer, Signal, QSignalBlocker, QRegularExpression, QStringListModel
-from PySide6.QtGui import QRegularExpressionValidator, QKeySequence, QColor, QPen, QPainter, QPainterPath, QPixmap
+from PySide6.QtGui import QRegularExpressionValidator, QKeySequence, QColor, QPen, QPainter, QPainterPath, QPixmap, QIcon
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,
  QLineEdit,QPushButton,QLabel,QTableWidget,QTableWidgetItem,QMessageBox,QComboBox,QCheckBox,
- QSplitter,QHeaderView,QAbstractItemView,QInputDialog,QDialog,QDialogButtonBox,QGridLayout,QGroupBox,QRadioButton,QButtonGroup,QFrame,QSizePolicy,QCompleter,QProxyStyle,QStyle)
+ QSplitter,QHeaderView,QAbstractItemView,QInputDialog,QDialog,QDialogButtonBox,QGroupBox,QFrame,QSizePolicy,QCompleter,QProxyStyle,QStyle)
 import oracledb
 
 # Oracle NUMBER deve chegar como Decimal, antes de qualquer exibição ou cálculo.
@@ -18,6 +20,7 @@ oracledb.defaults.fetch_decimals = True
 BASE_DIR = Path(getattr(sys, "executable", __file__)).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 ASSETS_DIR = Path(getattr(sys, '_MEIPASS', BASE_DIR)) / 'assets'
+APP_ICON_PATH = ASSETS_DIR / 'rb_app_icon.png'
 
 ALERT_STYLES = '''
     QMessageBox { background:#f4f8fc; color:#172b3a; font-size:13px; }
@@ -40,13 +43,29 @@ def show_alert(parent,title,message,icon=QMessageBox.Warning):
     message=str(message)
     uncertain_titles=('Conexão interrompida','Resultado da gravação não confirmado','Atualização da tela')
     if title not in uncertain_titles and any(code in message for code in ('ORA-','DPI-','DPY-')):
-        dialog.setText('Não foi possível concluir a operação no banco de dados.')
-        dialog.setInformativeText('Confira a conexão e tente novamente. Consulte os detalhes do erro abaixo.')
+        dialog.setText('Não foi possível concluir a operação\nno banco de dados.')
+        dialog.setInformativeText(
+            'Confira a conexão e tente novamente.\nConsulte os detalhes do erro abaixo.'
+        )
         dialog.setDetailedText(message)
+        details_button=next(
+            (button for button in dialog.findChildren(QPushButton)
+             if button.text() in ('Show Details...','Hide Details...')),
+            None,
+        )
+        if details_button is not None:
+            expanded=[False]
+            details_button.setText('Mostrar detalhes')
+            def toggle_details():
+                expanded[0]=not expanded[0]
+                details_button.setText('Ocultar detalhes' if expanded[0] else 'Mostrar detalhes')
+            details_button.clicked.connect(toggle_details)
     else:
         dialog.setText(message)
     if title=='Operação cancelada (ROLLBACK)':
-        dialog.setInformativeText('As alterações desta operação foram desfeitas. Revise os dados antes de tentar novamente.')
+        dialog.setInformativeText(
+            'As alterações desta operação foram desfeitas.\nRevise os dados antes de tentar novamente.'
+        )
     dialog.setStandardButtons(QMessageBox.Ok)
     dialog.button(QMessageBox.Ok).setText('Entendi')
     dialog.exec()
@@ -56,19 +75,22 @@ def show_error(parent,title,message):
     show_alert(parent,title,message,QMessageBox.Critical)
 
 
+def show_info(parent,title,message):
+    dialog=QMessageBox(parent)
+    dialog.setStyleSheet(ALERT_STYLES)
+    dialog.setIcon(QMessageBox.Information)
+    dialog.setWindowTitle(title)
+    dialog.setTextFormat(Qt.PlainText)
+    dialog.setText(str(message))
+    dialog.setStandardButtons(QMessageBox.Ok)
+    dialog.button(QMessageBox.Ok).setText('Entendi')
+    dialog.button(QMessageBox.Ok).setMinimumWidth(100)
+    dialog.setDefaultButton(QMessageBox.Ok)
+    dialog.exec()
+
+
 class DataChangedError(ValueError):
     pass
-
-
-def exact_quantity_sum(left,right):
-    left,right=Decimal(str(left)),Decimal(str(right))
-    with localcontext() as context:
-        context.prec=max(left.adjusted(),right.adjusted())-min(left.as_tuple().exponent,right.as_tuple().exponent)+3
-        result=left+right
-    significant=''.join(map(str,result.as_tuple().digits)).rstrip('0')
-    if len(significant)>38:
-        raise ValueError('A soma excede a precisão do Oracle. Revise as quantidades antes de continuar.')
-    return result
 
 
 def env_first(*names, default=""):
@@ -92,11 +114,171 @@ def winthor_launch_args():
             'alias_bd': alias_bd, 'usuario_bd': usuario_bd, 'codrotina': codrotina}
 
 
+def find_tns_directory(alias):
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", alias):
+        return None
+
+    candidates = []
+    seen = set()
+
+    def add(directory):
+        if not directory:
+            return
+        try:
+            path = Path(os.path.expandvars(str(directory).strip('" ')))
+            key = str(path).casefold()
+            if key not in seen:
+                seen.add(key)
+                candidates.append(path)
+        except (OSError, ValueError):
+            return
+
+    add(env_first("ORACLE_CONFIG_DIR", "TNS_ADMIN"))
+    bundle_dir = Path(getattr(sys, "_MEIPASS", BASE_DIR))
+    add(bundle_dir / "oracle_client" / "network" / "admin")
+    add(BASE_DIR / "oracle_client" / "network" / "admin")
+    oracle_home = os.getenv("ORACLE_HOME", "").strip()
+    if oracle_home:
+        add(Path(oracle_home) / "network" / "admin")
+
+    if os.name == "nt":
+        try:
+            import winreg
+        except ImportError:
+            winreg = None
+        if winreg is not None:
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for base in (r"SOFTWARE\ORACLE", r"SOFTWARE\WOW6432Node\ORACLE"):
+                    try:
+                        with winreg.OpenKey(root, base) as key:
+                            subkeys = [""]
+                            index = 0
+                            while True:
+                                try:
+                                    subkeys.append(winreg.EnumKey(key, index))
+                                    index += 1
+                                except OSError:
+                                    break
+                        for subkey in subkeys:
+                            path = base + ("\\" + subkey if subkey else "")
+                            try:
+                                with winreg.OpenKey(root, path) as key:
+                                    try:
+                                        add(winreg.QueryValueEx(key, "TNS_ADMIN")[0])
+                                    except OSError:
+                                        pass
+                                    try:
+                                        home = winreg.QueryValueEx(key, "ORACLE_HOME")[0]
+                                        add(Path(home) / "network" / "admin")
+                                    except OSError:
+                                        pass
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
+
+    for entry in os.getenv("PATH", "").split(os.pathsep):
+        if "oracle" in entry.lower() or "client" in entry.lower():
+            path = Path(entry.strip('" '))
+            add(path / "network" / "admin")
+            add(path.parent / "network" / "admin")
+
+    pattern = re.compile(r"(?im)^\s*" + re.escape(alias) + r"\s*=")
+    for folder in candidates:
+        tnsnames = folder / "tnsnames.ora"
+        try:
+            if tnsnames.is_file() and pattern.search(
+                    tnsnames.read_text(encoding="cp1252", errors="replace")):
+                return folder
+        except OSError:
+            continue
+    return None
+
+
+def find_oracle_client_dir(configured=None):
+    candidates = []
+    seen = set()
+
+    def add(directory):
+        if not directory:
+            return
+        try:
+            path = Path(os.path.expandvars(str(directory).strip('" '))).resolve()
+            key = str(path).casefold()
+            if key not in seen:
+                seen.add(key)
+                candidates.append(path)
+        except (OSError, ValueError):
+            return
+
+    add(configured)
+    add(Path(getattr(sys, "_MEIPASS", BASE_DIR)) / "oracle_client")
+    add(BASE_DIR / "oracle_client")
+    add(Path.cwd())
+
+    oracle_home = os.getenv("ORACLE_HOME", "").strip()
+    if oracle_home:
+        add(oracle_home)
+        add(Path(oracle_home) / "bin")
+
+    for entry in os.getenv("PATH", "").split(os.pathsep):
+        add(entry)
+
+    if os.name == "nt":
+        try:
+            import winreg
+        except ImportError:
+            winreg = None
+        if winreg is not None:
+            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+                for base in (r"SOFTWARE\ORACLE", r"SOFTWARE\WOW6432Node\ORACLE"):
+                    try:
+                        with winreg.OpenKey(root, base) as key:
+                            subkeys = [""]
+                            index = 0
+                            while True:
+                                try:
+                                    subkeys.append(winreg.EnumKey(key, index))
+                                    index += 1
+                                except OSError:
+                                    break
+                        for subkey in subkeys:
+                            registry_path = base + ("\\" + subkey if subkey else "")
+                            try:
+                                with winreg.OpenKey(root, registry_path) as key:
+                                    try:
+                                        home = winreg.QueryValueEx(key, "ORACLE_HOME")[0]
+                                    except OSError:
+                                        continue
+                                    add(home)
+                                    add(Path(home) / "bin")
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
+
+    expected_machine = 0x8664 if struct.calcsize("P") == 8 else 0x14C
+    for path in candidates:
+        oci_dll = path / "oci.dll"
+        try:
+            with oci_dll.open("rb") as client_file:
+                dos_header = client_file.read(64)
+                if dos_header[:2] != b"MZ":
+                    continue
+                client_file.seek(int.from_bytes(dos_header[0x3C:0x40], "little"))
+                pe_header = client_file.read(6)
+            if pe_header[:4] == b"PE\0\0" and int.from_bytes(pe_header[4:6], "little") == expected_machine:
+                return path
+        except OSError:
+            continue
+    return None
+
+
 def open_oracle_connection(winthor=None):
     # Compatível com o .env do projeto Gerenciador de Famílias.
-    mode = env_first("ORA_MODE", "ORACLE_MODE", default="thick").lower()
-    if mode not in ("thin", "thick"):
-        raise ValueError("ORA_MODE deve ser thin ou thick")
+    requested_mode = env_first("ORA_MODE", "ORACLE_MODE", default="auto").lower()
+    if requested_mode not in ("auto", "thin", "thick"):
+        raise ValueError("ORA_MODE deve ser auto, thin ou thick")
     user = winthor['usuario_bd'] if winthor else env_first("ORACLE_USER", "ORA_USER")
     password = winthor['senha_bd'] if winthor else env_first("ORACLE_PASSWORD", "ORA_PASSWORD")
     # Em execução WinThor, o alias recebido tem prioridade; .env define o modo e opcional TNS_ADMIN.
@@ -109,18 +291,62 @@ def open_oracle_connection(winthor=None):
             dsn = f"{host}:{port}/{service}"
     if not (user and password and dsn):
         raise ValueError("Configure ORACLE_USER, ORACLE_PASSWORD e ORACLE_DSN (ou HOST/PORT/SERVICE) no .env, ou inicie pelo WinThor com os parâmetros corretos.")
-    if mode == "thick":
-        # Prioriza a mesma pasta oracle_client usada no Gerenciador de Famílias.
-        configured = env_first("ORACLE_CLIENT_LIB_DIR", "ORA_CLIENT_LIB_DIR")
-        lib_dir = Path(configured) if configured else BASE_DIR / "oracle_client"
-        if not lib_dir.is_dir():
-            raise FileNotFoundError(f"Oracle Client 19 não encontrado em: {lib_dir}. Copie o Instant Client 19 completo para oracle_client ou defina ORACLE_CLIENT_LIB_DIR no .env")
-        config_dir = env_first("ORACLE_CONFIG_DIR", "TNS_ADMIN")
-        kwargs = {"lib_dir": str(lib_dir.resolve())}
-        if config_dir:
-            kwargs["config_dir"] = str(Path(config_dir).resolve())
+    configured = env_first("ORACLE_CLIENT_LIB_DIR", "ORA_CLIENT_LIB_DIR")
+    config_dir = env_first("ORACLE_CONFIG_DIR", "TNS_ADMIN")
+    config_path = Path(config_dir).resolve() if config_dir else None
+    if config_path is None:
+        config_path = find_tns_directory(dsn)
+
+    lib_dir = find_oracle_client_dir(configured)
+    if winthor:
+        if lib_dir is None:
+            raise FileNotFoundError(
+                "Oracle Client compatível com a arquitetura do programa não encontrado. "
+                "Inclua o Oracle Client x64 na pasta oracle_client ao compilar."
+            )
+        kwargs = {"lib_dir": str(lib_dir)}
+        if config_path:
+            kwargs["config_dir"] = str(config_path)
         oracledb.init_oracle_client(**kwargs)
-    conn = oracledb.connect(user=user, password=password, dsn=dsn, program="RB1601")
+        mode = "thick"
+    elif requested_mode == "thick":
+        if lib_dir is None:
+            raise FileNotFoundError(
+                "Oracle Client não encontrado. Verifique ORACLE_HOME, PATH ou "
+                "ORACLE_CLIENT_LIB_DIR; a pasta deve conter oci.dll."
+            )
+        kwargs = {"lib_dir": str(lib_dir)}
+        if config_path:
+            kwargs["config_dir"] = str(config_path)
+        oracledb.init_oracle_client(**kwargs)
+        mode = "thick"
+    elif requested_mode == "auto":
+        kwargs = {}
+        if lib_dir is not None:
+            kwargs["lib_dir"] = str(lib_dir)
+        if config_path:
+            kwargs["config_dir"] = str(config_path)
+        try:
+            oracledb.init_oracle_client(**kwargs)
+        except oracledb.DatabaseError as error:
+            if "DPI-1047" not in str(error):
+                raise
+            mode = "thin"
+        else:
+            mode = "thick"
+    else:
+        mode = "thin"
+
+    if mode == "thin" and re.fullmatch(r"[A-Za-z0-9_.-]+", dsn) and config_path is None:
+        raise FileNotFoundError(
+            f"Não foi encontrado um tnsnames.ora com o alias {dsn}. "
+            "Configure TNS_ADMIN ou verifique a configuração Oracle deste computador."
+        )
+
+    connect_kwargs = {"user": user, "password": password, "dsn": dsn, "program": "RB1601"}
+    if mode == "thin" and config_path:
+        connect_kwargs["config_dir"] = str(config_path)
+    conn = oracledb.connect(**connect_kwargs)
     conn.autocommit = False
     return conn, mode
 
@@ -310,7 +536,7 @@ class SearchField(QWidget):
 
 def make_item(value, color=None):
     item=QTableWidgetItem('' if value is None else str(value))
-    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+    item.setFlags(item.flags() & ~(Qt.ItemIsEditable | Qt.ItemIsUserCheckable))
     if color:
         from PySide6.QtGui import QColor
         item.setBackground(QColor(color))
@@ -328,7 +554,10 @@ class App(QMainWindow):
         if not isinstance(QApplication.instance().style(),BlueIndicatorStyle):
             QApplication.instance().setStyle(BlueIndicatorStyle('Fusion'))
         QApplication.instance().setStyleSheet(ALERT_STYLES)
-        self.setWindowTitle('1601-X · Copiar Formulação de Produto Industrializado')
+        app_icon=QIcon(str(APP_ICON_PATH))
+        QApplication.instance().setWindowIcon(app_icon)
+        self.setWindowIcon(app_icon)
+        self.setWindowTitle('Clonar Estrutura de Produto')
         self.resize(1200,570)
         self.setMinimumSize(970,460)
         self.conn=None
@@ -382,9 +611,8 @@ class App(QMainWindow):
         self.origin_branch.currentIndexChanged.connect(self.invalidate_origin)
         self.dest_branch.currentIndexChanged.connect(self.invalidate_dest)
         self.source_table=self.create_table(['✓','Código','Matéria-prima / Componente','Un','Qtde','Fração','Etapa','Mét.'])
-        self.target_table=self.create_table(['Excluir','Código','Matéria-prima / Componente','Un','Qtde','Fração','Etapa'])
+        self.target_table=self.create_table(['Código','Matéria-prima / Componente','Un','Qtde','Fração','Etapa'])
         self.source_table.itemChanged.connect(self.on_table_change)
-        self.target_table.itemChanged.connect(self.on_table_change)
         for group,field,table,is_origin in [(self.origin_group,self.origin,self.source_table,True),(self.dest_group,self.dest,self.target_table,False)]:
             lay=QVBoxLayout(group)
             lay.setContentsMargins(6,7,6,6)
@@ -398,37 +626,18 @@ class App(QMainWindow):
             top.addWidget(self.origin_method if is_origin else self.method)
             lay.addLayout(top)
             lay.addWidget(table,1)
-            table.horizontalHeader().setSectionResizeMode(2,QHeaderView.Stretch)
-            table.setColumnWidth(0,44)
-            table.setColumnWidth(1,64)
-            table.setColumnWidth(3,37)
-            table.setColumnWidth(4,67)
-            table.horizontalHeader().setSectionResizeMode(4,QHeaderView.ResizeToContents)
-            table.setColumnWidth(5,54)
-            table.setColumnWidth(6,102)
-            if is_origin: table.setColumnWidth(7,42)
+            if is_origin:
+                table.horizontalHeader().setSectionResizeMode(2,QHeaderView.Stretch)
+                for column,width in ((0,44),(1,64),(3,37),(4,67),(5,54),(6,102),(7,42)):
+                    table.setColumnWidth(column,width)
+                table.horizontalHeader().setSectionResizeMode(4,QHeaderView.ResizeToContents)
+            else:
+                table.horizontalHeader().setSectionResizeMode(1,QHeaderView.Stretch)
+                for column,width in ((0,64),(2,37),(3,67),(4,54),(5,102)):
+                    table.setColumnWidth(column,width)
+                table.horizontalHeader().setSectionResizeMode(3,QHeaderView.ResizeToContents)
         bottom=QHBoxLayout()
         layout.addLayout(bottom)
-        policy=QGroupBox('Tratamento de duplicidade')
-        policy_layout=QGridLayout(policy)
-        policy_layout.setContentsMargins(8,5,8,5)
-        policy_layout.setSpacing(1)
-        self.ignore=QRadioButton('Ignorar existentes')
-        self.replace=QRadioButton('Substituir quantidade')
-        self.sum=QRadioButton('Somar quantidades')
-        self.ignore.setChecked(True)
-        for row,(w,description) in enumerate((
-            (self.ignore,'Mantém a quantidade no destino.'),
-            (self.replace,'Usa a quantidade da origem.'),
-            (self.sum,'Soma origem + destino.'),
-        )):
-            policy_layout.addWidget(w,row,0)
-            help_label=QLabel(description)
-            help_label.setWordWrap(True)
-            policy_layout.addWidget(help_label,row,1)
-            w.setToolTip(description)
-            w.toggled.connect(self.invalidate_plan)
-        bottom.addWidget(policy,3)
         summary=QGroupBox('Resumo da comparação')
         summary_layout=QVBoxLayout(summary)
         summary_layout.setContentsMargins(8,5,8,5)
@@ -441,8 +650,8 @@ class App(QMainWindow):
         legend_layout.setContentsMargins(8,5,8,5)
         legend_text=QLabel('Pesquisa: Código = exato; Descrição = início do nome.\n'
                           '%nome = qualquer parte. Busca automática ao digitar.\n'
-                          '🟨 Já existe no destino · ☑ Vínculo selecionado\n'
-                          'Exclusões afetam apenas PCCOMPOSICAO.')
+                          '☑ Marque na origem somente os componentes a copiar.\n'
+                          'A estrutura final do destino ficará igual à seleção.')
         legend_text.setWordWrap(True)
         legend_layout.addWidget(legend_text)
         bottom.addWidget(legend,4)
@@ -471,7 +680,7 @@ class App(QMainWindow):
             QPushButton { background:#e3e9ee; color:#142b3b; padding:4px 9px; border:1px solid #aab5bf; }
             QPushButton:disabled { color:#8a9199; }
             QPushButton#primary { background:#005a97; color:white; font-weight:bold; }
-            QLabel,QRadioButton { color:#17232e; font-weight:normal; }
+            QLabel { color:#17232e; font-weight:normal; }
         '''+ALERT_STYLES)
         self.confirm.setObjectName('primary')
         QTimer.singleShot(0,self.connect_db)
@@ -495,14 +704,11 @@ class App(QMainWindow):
     def same_product_branch(self):
         return self.origin.code==self.dest.code and self.origin_branch.currentData()==self.dest_branch.currentData()
 
-    def update_comparison(self,source_checks=None,target_checks=None):
+    def update_comparison(self,source_checks=None):
         if source_checks is None:
             source_checks=[self.source_table.item(i,0).checkState() for i in range(self.source_table.rowCount())]
             if len(source_checks)!=len(self.source):source_checks=None
-        if target_checks is None:
-            target_checks=[self.target_table.item(i,0).checkState() for i in range(self.target_table.rowCount())]
-            if len(target_checks)!=len(self.target):target_checks=None
-        self.populate(source_checks,target_checks)
+        self.populate(source_checks)
         self.statusBar().showMessage(f'Origem: {len(self.source)} componentes | Destino: {len(self.target)} componentes')
 
     def invalidate_comparison(self,*_):
@@ -609,6 +815,16 @@ class App(QMainWindow):
             self.connection_status.setText('Sem conexão')
             show_error(self,'Conexão Oracle',str(exc))
 
+    def closeEvent(self,event):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception as exc:
+                show_error(self,'Encerramento da conexão Oracle',str(exc))
+                event.ignore()
+                return
+        event.accept()
+
     def available_branches(self):
         with self.conn.cursor() as cur:
             cur.execute('SELECT CODIGO FROM PCFILIAL ORDER BY CODIGO')
@@ -639,9 +855,8 @@ class App(QMainWindow):
     def collision(self,a,b):
         return key(a)==key(b) or physical_key(a)==physical_key(b)
 
-    def populate(self,selections=None,target_selections=None):
+    def populate(self,selections=None):
         source_blocker=QSignalBlocker(self.source_table)
-        target_blocker=QSignalBlocker(self.target_table)
         self.source_table.setRowCount(len(self.source))
         self.target_table.setRowCount(len(self.target))
         for i,r in enumerate(self.source):
@@ -661,13 +876,9 @@ class App(QMainWindow):
         for i,r in enumerate(self.target):
             conflict=any(self.collision(dict(s,METODO=self.method.currentText().strip()),r) for s in self.source)
             color='#fff0b9' if conflict else None
-            check=QTableWidgetItem('')
-            check.setFlags(Qt.ItemIsEnabled|Qt.ItemIsUserCheckable|Qt.ItemIsSelectable)
-            check.setCheckState(target_selections[i] if target_selections is not None else Qt.Unchecked)
-            self.target_table.setItem(i,0,check)
             etapa=(f'{r["NUMETAPA"]} - {r["DESC_ETAPA"]}' if r.get('NUMETAPA') and r.get('DESC_ETAPA') else r.get('NUMETAPA'))
             vals=[r['CODPROD'],r.get('DESC_COMPONENTE'),r.get('UNESTRUTURA') or r.get('UN_COMPONENTE'),fmt_qty(r.get('QT')),r.get('FRACAOUMIDA'),etapa]
-            for j,val in enumerate(vals,1):self.target_table.setItem(i,j,make_item(val,color))
+            for j,val in enumerate(vals):self.target_table.setItem(i,j,make_item(val,color))
         self.invalidate_plan()
 
     def on_table_change(self,item):
@@ -676,25 +887,36 @@ class App(QMainWindow):
 
     def refresh_summary(self):
         if not hasattr(self,'summary'):return
-        selected=sum(self.source_table.item(i,0).checkState()==Qt.Checked for i in range(self.source_table.rowCount()))
-        existing=sum(any(self.collision(dict(s,METODO=self.method.currentText().strip()),t) for t in self.target) for s in self.source)
-        self.summary.setText(f'Selecionados: {selected}\nNovos no destino: {max(0,selected-existing)}\nJá existentes: {existing}')
+        selected=[self.source[i] for i in range(min(len(self.source),self.source_table.rowCount()))
+                  if self.source_table.item(i,0).checkState()==Qt.Checked]
+        selected_rows=[dict(row,METODO=self.method.currentText().strip()) for row in selected]
+        to_update=sum(
+            any(self.collision(row,target) for target in self.target)
+            for row in selected_rows
+        )
+        to_remove=max(0,len(self.target)-to_update)
+        to_insert=max(0,len(selected_rows)-to_update)
+        self.summary.setText(
+            f'Selecionados na origem: {len(selected)}\n'
+            f'Componentes existentes a atualizar: {to_update}\n'
+            f'Componentes excedentes a remover: {to_remove}\n'
+            f'Componentes novos a inserir: {to_insert}'
+        )
 
     def fingerprint(self,rows):
         # Snapshot de todos os campos técnicos usados na cópia, incluindo QT.
         return Counter(tuple(str(r.get(c)) for c in FIELDS) for r in rows)
 
-    def build_plan(self,target=None,removals=None):
+    def build_plan(self,target=None):
         if self.connection_uncertain:raise ValueError('A conexão foi interrompida. Reinicie a rotina e confira os dados no banco antes de tentar novamente.')
         if self.operation_completed:raise ValueError('Esta operação já foi concluída. Selecione os componentes para iniciar uma nova cópia.')
         if not self.origin_loaded or self.snapshot is None:raise ValueError('Aguarde a consulta da origem e do destino antes de confirmar.')
         if self.same_product_branch() and (self.method.currentText().strip()==self.origin_method.currentText().strip() or self.target):
             raise ValueError('Para copiar o mesmo produto na mesma filial, informe um método novo no destino.')
         if target is None:target=self.target
-        if removals is None:
-            removals={i for i in range(len(self.target)) if self.target_table.item(i,0).checkState()==Qt.Checked}
+        removals=set(range(len(target)))
+        updates=[]
         inserts=[]
-        updates={}
         selected=[dict(self.source[i],METODO=self.method.currentText().strip()) for i in range(len(self.source)) if self.source_table.item(i,0).checkState()==Qt.Checked]
         # Componentes da origem consolidados no mesmo método devem ser únicos.
         for i,a in enumerate(selected):
@@ -704,26 +926,23 @@ class App(QMainWindow):
         for cand in selected:
             if int(cand['CODPROD'])==self.dest.code:
                 raise ValueError(f'O produto destino {self.dest.code} está selecionado como componente. Desmarque esse item na origem: um produto não pode fazer parte da própria composição.')
-            matches=[j for j,t in enumerate(target) if self.collision(cand,t)]
-            remaining=[j for j in matches if j not in removals]
-            if len(remaining)>1:raise ValueError(f'Conflito múltiplo do componente {cand["CODPROD"]}. Revise os vínculos do destino.')
-            if not remaining:
-                inserts.append(cand)
-            elif self.ignore.isChecked():
-                continue
+            logical_matches=[j for j,t in enumerate(target)
+                             if j in removals and key(cand)==key(t)]
+            physical_matches=[j for j,t in enumerate(target)
+                              if j in removals and physical_key(cand)==physical_key(t)]
+            matches=logical_matches or physical_matches
+            if len(matches)>1:
+                raise ValueError(
+                    f'Foram encontrados vários vínculos no destino para o componente '
+                    f'{cand["CODPROD"]}. Revise a estrutura antes de substituir.'
+                )
+            if matches:
+                index=matches[0]
+                removals.remove(index)
+                updates.append({'index':index,'row':cand})
             else:
-                j=remaining[0]
-                old=target[j]
-                source_unit=as_text(cand.get('UNESTRUTURA') or cand.get('UN_COMPONENTE')).strip().upper()
-                target_unit=as_text(old.get('UNESTRUTURA') or old.get('UN_COMPONENTE')).strip().upper()
-                if not source_unit or not target_unit or source_unit!=target_unit:
-                    raise ValueError(f'O componente {cand["CODPROD"]} tem unidades incompatíveis: origem {source_unit or "não informada"}, destino {target_unit or "não informada"}. Não é possível somar ou substituir sem revisar as unidades.')
-                if old.get('QT') is None or cand.get('QT') is None:
-                    raise ValueError(f'Quantidade ausente no componente {cand["CODPROD"]}.')
-                value=Decimal(str(cand['QT']))
-                if self.sum.isChecked():value=exact_quantity_sum(value,old['QT'])
-                updates[j]=value
-        return {'inserts':inserts,'removals':sorted(removals),'updates':updates}
+                inserts.append(cand)
+        return {'inserts':inserts,'updates':updates,'removals':sorted(removals)}
 
     def confirm_changes(self):
         try:
@@ -741,11 +960,17 @@ class App(QMainWindow):
             if any(self.source_table.item(i,0).checkState()==Qt.Checked for i in range(len(self.source))):
                 scope=QMessageBox(self)
                 scope.setWindowTitle('Filiais da cópia')
-                scope.setText('Deseja copiar a estrutura selecionada para todas as filiais?')
-                scope.setInformativeText(f'Escolha todas as filiais ou somente a filial {chosen}, selecionada no destino.')
+                scope.setText('Deseja copiar a estrutura selecionada\npara todas as filiais?')
+                scope.setInformativeText(
+                    f'Escolha todas as filiais ou somente a filial\n{chosen}, selecionada no destino.'
+                )
                 only=scope.addButton(f'Somente filial {chosen}',QMessageBox.AcceptRole)
                 all_branches=scope.addButton('Todas as filiais',QMessageBox.ActionRole)
-                scope.addButton(QMessageBox.Cancel)
+                cancel=scope.addButton(QMessageBox.Cancel)
+                cancel.setText('Cancelar')
+                only.setMinimumWidth(180)
+                all_branches.setMinimumWidth(160)
+                cancel.setMinimumWidth(110)
                 scope.setDefaultButton(only)
                 scope.exec()
                 if scope.clickedButton()==all_branches:
@@ -761,18 +986,37 @@ class App(QMainWindow):
                 target=self.target if branch==chosen else self.fetch(self.dest.code,branch,self.method.currentText().strip())
                 if self.origin.code==self.dest.code and branch==self.origin_branch.currentData() and target:
                     raise ValueError('O método destino já existe na filial de origem. Para o mesmo produto e filial, escolha um método novo.')
-                plan=self.build_plan() if branch==chosen else self.build_plan(target,removals=set())
+                plan=self.build_plan() if branch==chosen else self.build_plan(target)
                 batches.append({'branch':branch,'target':target,'snapshot':self.snapshot if branch==chosen else self.fingerprint(target),'plan':plan})
-            if not any(b['plan']['inserts'] or b['plan']['removals'] or b['plan']['updates'] for b in batches):
-                QMessageBox.information(self,'Sem alterações','Nenhuma alteração a gravar.')
+            if not any(b['plan']['inserts'] or b['plan']['updates'] or b['plan']['removals'] for b in batches):
+                show_info(self,'Sem alterações','Nenhuma alteração a gravar.')
                 return
             details=(f'Produto destino: {self.dest.code} | Método: {self.method.currentText()}\n'
                 f'Filiais: {", ".join(branches)}\n'
                 'O método de origem é preservado.\n\n'+
-                '\n'.join(f'Filial {b["branch"]}: inserir {len(b["plan"]["inserts"])}, alterar {len(b["plan"]["updates"])}, excluir {len(b["plan"]["removals"])}' for b in batches)+
-                '\n\nExclusões marcadas afetam somente a filial filtrada no destino.\n'
-                'As alterações serão feitas no Oracle. Deseja continuar?')
-            if QMessageBox.question(self,'Confirmar alterações',details,QMessageBox.Yes|QMessageBox.No,QMessageBox.No)!=QMessageBox.Yes:return
+                '\n'.join(
+                    f'Filial {b["branch"]}: atualizar {len(b["plan"]["updates"])} existentes, '
+                    f'remover {len(b["plan"]["removals"])} excedentes e inserir '
+                    f'{len(b["plan"]["inserts"])} novos'
+                    for b in batches
+                )+
+                '\n\nA estrutura final ficará igual aos componentes marcados na origem.\n'
+                'Vínculos com a mesma chave serão atualizados para respeitar a trigger Oracle.\n'
+                'As alterações serão feitas no Oracle.\nDeseja continuar?')
+            confirmation=QMessageBox(self)
+            confirmation.setIcon(QMessageBox.Question)
+            confirmation.setWindowTitle('Confirmar alterações')
+            confirmation.setText(details)
+            confirmation.setStandardButtons(QMessageBox.Yes|QMessageBox.No)
+            yes=confirmation.button(QMessageBox.Yes)
+            no=confirmation.button(QMessageBox.No)
+            yes.setText('Sim')
+            no.setText('Não')
+            yes.setMinimumWidth(100)
+            no.setMinimumWidth(100)
+            confirmation.setMinimumWidth(640)
+            confirmation.setDefaultButton(QMessageBox.No)
+            if confirmation.exec()!=QMessageBox.Yes:return
             self.commit(batches,operation)
         except Exception as exc:
             show_alert(self,'Validação',str(exc))
@@ -800,18 +1044,28 @@ class App(QMainWindow):
                     current=self.cursor_rows(cur)
                     if self.fingerprint(current)!=batch['snapshot']:
                         raise DataChangedError(f'Os dados pesquisados do destino na filial {batch["branch"]} foram alterados. Atualize a pesquisa e revise os componentes antes de concluir a transação.')
-                    def where(row):
-                        return {'p':operation['product'],'f':batch['branch'],'m':operation['method'],
-                            'c':row['CODPROD'],'fr':row['FRACAOUMIDA'],'et':row['NUMETAPA']}
-                    condition='''CODPRODMASTER=:p AND CODFILIAL=:f AND METODO=:m AND CODPROD=:c
+                    def row_where(row):
+                        return {
+                            'p':operation['product'],'f':batch['branch'],'m':operation['method'],
+                            'c':row['CODPROD'],'fr':row.get('FRACAOUMIDA'),'et':row.get('NUMETAPA'),
+                        }
+                    row_condition='''CODPRODMASTER=:p AND CODFILIAL=:f AND METODO=:m AND CODPROD=:c
                         AND (FRACAOUMIDA=:fr OR (FRACAOUMIDA IS NULL AND :fr IS NULL))
                         AND (NUMETAPA=:et OR (NUMETAPA IS NULL AND :et IS NULL))'''
-                    for j in plan['removals']:
-                        cur.execute('DELETE FROM PCCOMPOSICAO WHERE '+condition,where(batch['target'][j]))
-                        if cur.rowcount!=1:raise ValueError('Exclusão não encontrou exatamente um vínculo.')
-                    for j,value in plan['updates'].items():
-                        cur.execute('UPDATE PCCOMPOSICAO SET QT=:qt WHERE '+condition,dict(where(batch['target'][j]),qt=value))
-                        if cur.rowcount!=1:raise ValueError('Atualização não encontrou exatamente um vínculo.')
+                    for index in plan['removals']:
+                        cur.execute('DELETE FROM PCCOMPOSICAO WHERE '+row_condition,
+                                    row_where(batch['target'][index]))
+                        if cur.rowcount!=1:
+                            raise ValueError('Não foi possível remover exatamente um componente excedente do destino.')
+                    assignments=', '.join(f'{column}=:u{i}' for i,column in enumerate(COPY_FIELDS))
+                    update_sql='UPDATE PCCOMPOSICAO SET '+assignments+' WHERE '+row_condition
+                    for update in plan['updates']:
+                        values={f'u{i}':update['row'].get(column)
+                                for i,column in enumerate(COPY_FIELDS)}
+                        values.update(row_where(batch['target'][update['index']]))
+                        cur.execute(update_sql,values)
+                        if cur.rowcount!=1:
+                            raise ValueError('Não foi possível atualizar exatamente um vínculo correspondente no destino.')
                     cols=['CODPRODMASTER','CODFILIAL','METODO']+COPY_FIELDS
                     bindcols=[f':v{i}' for i in range(len(cols))]
                     sql=f'INSERT INTO PCCOMPOSICAO ({", ".join(cols)}, DTCADASTRO) VALUES ({", ".join(bindcols)}, SYSDATE)'
@@ -832,7 +1086,14 @@ class App(QMainWindow):
             committed=True
             self.plan=None
             self.finish_operation()
-            QMessageBox.information(self,'Concluído','Formulação atualizada com sucesso. Operação finalizada; selecione novamente os componentes para iniciar outra cópia.')
+            show_info(
+                self,
+                'Concluído',
+                'Formulação atualizada com sucesso.\n'
+                'Operação concluída.\n'
+                'Para outra cópia, selecione novamente\n'
+                'os componentes.',
+            )
         except Exception as exc:
             if committed:
                 self.operation_completed=True
@@ -876,9 +1137,9 @@ class App(QMainWindow):
     def finish_operation(self):
         self.operation_completed=True
         self.load_destination()
-        with QSignalBlocker(self.source_table),QSignalBlocker(self.target_table):
-            for table in (self.source_table,self.target_table):
-                for i in range(table.rowCount()):table.item(i,0).setCheckState(Qt.Unchecked)
+        with QSignalBlocker(self.source_table):
+            for i in range(self.source_table.rowCount()):
+                self.source_table.item(i,0).setCheckState(Qt.Unchecked)
         self.operation_completed=True
         self.invalidate_plan()
         self.statusBar().showMessage('Operação concluída. Selecione os componentes para iniciar uma nova cópia.')

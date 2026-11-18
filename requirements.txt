@@ -1,4 +1,10 @@
+# Pacotes Python para desenvolvimento e compilacao em Windows.
+# Compilacao validada com Python 3.14.7 x64; o Python e instalado separadamente.
+# O executavel final inclui as dependencias Python; a estacao de execucao
+# nao precisa instalar estes pacotes nem o Oracle Client x64.
 PySide6>=6.5,<7
 oracledb>=3.4,<4
+cryptography>=41,<51
 python-dotenv>=1,<2
+# Ferramenta de build; nao e necessaria para executar o EXE.
 pyinstaller>=6,<7
